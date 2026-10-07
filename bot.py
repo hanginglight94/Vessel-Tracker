@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -25,7 +26,7 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "3600"))  # Default: 1 ho
 ASK_MMSI, TRACKING = range(2)
 
 # Active tracking sessions stored by chat_id
-# Structure: {chat_id: {"active": bool, "id": str, "last_summary": str, "stop_event": threading.Event}}
+# Structure: {chat_id: {"active": bool, "id": str, "task": asyncio.Task}}
 active_trackers = {}
 
 logging.basicConfig(
@@ -44,6 +45,11 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK - Vessel Tracker Bot is running!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
 
     def log_message(self, format, *args):
         # Suppress routine ping logging from UptimeRobot
@@ -102,40 +108,64 @@ def format_vessel_message(info: dict) -> str:
     return "\n".join(msg_lines)
 
 
-# --- BACKGROUND TRACKING LOOP ---
+# --- NATIVE ASYNC BACKGROUND TRACKING LOOP ---
 
-def tracking_worker(chat_id, vessel_id, app, stop_event):
-    """Background thread loop that polls vessel telemetry every interval."""
-    logger.info(f"Background tracking started for chat {chat_id}, ID {vessel_id}")
-    while not stop_event.is_set() and active_trackers.get(chat_id, {}).get("active", False):
-        if stop_event.wait(timeout=POLL_INTERVAL_SECONDS):
-            break
+async def tracking_loop(chat_id: int, vessel_id: str, bot):
+    """
+    Native asyncio background task that polls vessel telemetry every interval.
+    Uses asyncio.sleep and awaits bot.send_message directly on the main event loop.
+    """
+    logger.info(f"Background async tracking started for chat {chat_id}, ID {vessel_id}")
+    try:
+        while active_trackers.get(chat_id, {}).get("active", False):
+            # Sleep for the configured interval
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-        if not active_trackers.get(chat_id, {}).get("active", False):
-            break
+            if not active_trackers.get(chat_id, {}).get("active", False):
+                break
 
-        info = fetch_vessel_telemetry(vessel_id)
+            logger.info(f"Polling vessel telemetry update for chat {chat_id}, ID {vessel_id}...")
 
-        if info and (info.get("summary") or info.get("lat")):
-            msg_text = format_vessel_message(info)
-            app.create_task(
-                app.bot.send_message(
+            # Run synchronous scraping in thread pool without blocking event loop
+            try:
+                info = await asyncio.to_thread(fetch_vessel_telemetry, vessel_id)
+            except Exception as e:
+                logger.error(f"Scraper error during polling for {vessel_id}: {e}")
+                info = None
+
+            if info and (info.get("summary") or info.get("lat")):
+                msg_text = format_vessel_message(info)
+            else:
+                msg_text = f"⚠️ Unable to retrieve new telemetry update for `{vessel_id}`."
+
+            # Dispatch message with fallback to plain text if Markdown entity parsing fails
+            try:
+                await bot.send_message(
                     chat_id=chat_id,
                     text=msg_text,
                     parse_mode="Markdown",
                     disable_web_page_preview=False,
                 )
-            )
-        else:
-            app.create_task(
-                app.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⚠️ Unable to retrieve new telemetry update for `{vessel_id}`.",
-                    parse_mode="Markdown",
-                )
-            )
+                logger.info(f"Tracking update successfully dispatched to chat {chat_id} for {vessel_id}")
+            except Exception as e:
+                logger.warning(f"Markdown send failed ({e}), falling back to plain text...")
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=msg_text,
+                        parse_mode=None,
+                        disable_web_page_preview=False,
+                    )
+                    logger.info(f"Tracking update (plain text fallback) dispatched to chat {chat_id}")
+                except Exception as err:
+                    logger.error(f"Failed to dispatch message to chat {chat_id}: {err}")
 
-    logger.info(f"Background tracking terminated for chat {chat_id}, ID {vessel_id}")
+    except asyncio.CancelledError:
+        logger.info(f"Tracking loop cancelled for chat {chat_id}, ID {vessel_id}")
+    except Exception as e:
+        logger.error(f"Unexpected error in tracking loop for chat {chat_id}: {e}")
+    finally:
+        logger.info(f"Background tracking loop terminated for chat {chat_id}, ID {vessel_id}")
 
 
 # --- CONVERSATION HANDLERS ---
@@ -161,7 +191,7 @@ async def receive_mmsi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     await update.message.reply_text(f"🔎 Searching VesselFinder for `{vessel_id}`...", parse_mode="Markdown")
 
-    info = fetch_vessel_telemetry(vessel_id)
+    info = await asyncio.to_thread(fetch_vessel_telemetry, vessel_id)
     if not info or not (info.get("summary") or info.get("lat")):
         await update.message.reply_text(
             f"❌ Could not locate vessel `{vessel_id}` on VesselFinder.\n\n"
@@ -170,24 +200,20 @@ async def receive_mmsi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return ASK_MMSI
 
+    # Cancel previous async tracking task for this chat if exists
     if chat_id in active_trackers:
         active_trackers[chat_id]["active"] = False
-        active_trackers[chat_id]["stop_event"].set()
+        old_task = active_trackers[chat_id].get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
 
-    stop_event = threading.Event()
+    # Launch native asyncio task
+    task = asyncio.create_task(tracking_loop(chat_id, vessel_id, context.bot))
     active_trackers[chat_id] = {
         "active": True,
         "id": vessel_id,
-        "last_summary": info.get("summary", ""),
-        "stop_event": stop_event,
+        "task": task,
     }
-
-    thread = threading.Thread(
-        target=tracking_worker,
-        args=(chat_id, vessel_id, context.application, stop_event),
-        daemon=True,
-    )
-    thread.start()
 
     interval_minutes = max(1, POLL_INTERVAL_SECONDS // 60)
     reply_keyboard = [["/stop"]]
@@ -212,7 +238,9 @@ async def stop_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if chat_id in active_trackers:
         active_trackers[chat_id]["active"] = False
-        active_trackers[chat_id]["stop_event"].set()
+        task = active_trackers[chat_id].get("task")
+        if task and not task.done():
+            task.cancel()
         del active_trackers[chat_id]
 
     await update.message.reply_text(
@@ -229,7 +257,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     chat_id = update.message.chat_id
     if chat_id in active_trackers:
         active_trackers[chat_id]["active"] = False
-        active_trackers[chat_id]["stop_event"].set()
+        task = active_trackers[chat_id].get("task")
+        if task and not task.done():
+            task.cancel()
         del active_trackers[chat_id]
 
     await update.message.reply_text(
